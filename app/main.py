@@ -5,8 +5,11 @@ import importlib.util
 import logging
 from flask import Flask, Response
 
-# 配置日志，确保 Zeabur 控制台能看到
-logging.basicConfig(level=logging.INFO)
+# 设置日志格式
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
@@ -14,15 +17,19 @@ app = Flask(__name__)
 def load_spider_class(filepath):
     """动态加载 Python 脚本中的 Spider 类"""
     try:
+        # 路径防御：确保路径是绝对路径
+        if not os.path.isabs(filepath):
+            filepath = os.path.join(os.getcwd(), filepath)
+
         if not os.path.exists(filepath):
-            logger.error(f"文件不存在: {filepath}")
+            logger.error(f"FATAL: 文件不存在 -> {filepath}")
             return None
 
-        # 获取模块名
         module_name = os.path.basename(filepath).replace('.py', '')
         spec = importlib.util.spec_from_file_location(module_name, filepath)
+        
         if spec is None or spec.loader is None:
-            logger.error(f"无法加载模块规范: {filepath}")
+            logger.error(f"FATAL: 无法读取模块 -> {filepath}")
             return None
             
         module = importlib.util.module_from_spec(spec)
@@ -30,48 +37,61 @@ def load_spider_class(filepath):
         spec.loader.exec_module(module)
         
         if hasattr(module, 'Spider'):
+            logger.info(f"成功加载 Spider 类: {module_name}")
             return module.Spider
         else:
-            logger.error(f"模块 {module_name} 中未找到 Spider 类")
+            logger.error(f"模块中未找到 Spider 类: {module_name}")
             return None
     except Exception as e:
-        logger.error(f"加载模块 {filepath} 出错: {e}")
+        logger.exception(f"加载模块异常 {filepath}: {e}")
         return None
 
+# 健康检查接口
 @app.route('/')
-def index():
-    return "<h1>IPTV Service is Running</h1><p>Status: OK</p><p>Link: <a href='/iptv.m3u'>/iptv.m3u</a></p>"
+def health_check():
+    return "IPTV Service OK (Port 5000)", 200
 
 @app.route('/iptv.m3u')
 def get_m3u():
     m3u_content = ["#EXTM3U"]
     
-    config_path = 'iptv.json'
-    if not os.path.exists(config_path):
-        return f"配置丢失: 找不到 {config_path}", 500
+    # 尝试多种路径寻找 json
+    possible_paths = ['iptv.json', 'app/iptv.json']
+    config_path = None
+    for p in possible_paths:
+        if os.path.exists(p):
+            config_path = p
+            break
+            
+    if not config_path:
+        logger.error("找不到 iptv.json")
+        return "Config file not found", 500
 
     try:
         with open(config_path, 'r', encoding='utf-8') as f:
             config = json.load(f)
     except Exception as e:
-        logger.error(f"读取配置文件失败: {e}")
-        return f"配置错误: {e}", 500
+        return f"JSON Config Error: {e}", 500
 
     for item in config.get('lives', []):
         name = item.get('name')
         api_path = item.get('api')
         
-        # 路径清理
+        # 处理 file:// 前缀
         if api_path.startswith('file://'):
-            real_path = api_path.replace('file://', '')
+            clean_path = api_path.replace('file://', '')
         else:
-            real_path = api_path
+            clean_path = api_path
 
-        # 路径修正：如果是相对路径，确保基于当前工作目录
-        if not os.path.isabs(real_path):
-            real_path = os.path.join(os.getcwd(), real_path)
+        # 路径修正逻辑
+        # Docker 中 WORKDIR 是 /app
+        # 如果 json 写的是 Download/kzb.py，那么完整路径应该是 /app/Download/kzb.py
+        if not os.path.isabs(clean_path):
+            real_path = os.path.join(os.getcwd(), clean_path)
+        else:
+            real_path = clean_path
 
-        logger.info(f"正在抓取: {name} (路径: {real_path})")
+        logger.info(f"开始任务: {name} | 路径: {real_path}")
         
         SpiderClass = load_spider_class(real_path)
         if SpiderClass:
@@ -80,23 +100,24 @@ def get_m3u():
                 ext_str = json.dumps(item.get('ext', {}))
                 spider.init(ext_str)
                 
-                # 抓取内容
                 content = spider.liveContent(None)
                 
-                # 清理重复的头
                 if content:
                     lines = content.split('\n')
-                    valid_lines = [line for line in lines if line.strip() and '#EXTM3U' not in line]
+                    # 过滤空行和重复头
+                    valid_lines = [l for l in lines if l.strip() and '#EXTM3U' not in l]
                     m3u_content.extend(valid_lines)
+                    logger.info(f"任务完成: {name} - 获取到 {len(valid_lines)//2} 个频道")
                 else:
-                    logger.warning(f"{name} 返回内容为空")
+                    logger.warning(f"任务返回空: {name}")
 
             except Exception as e:
-                logger.error(f"执行爬虫 {name} 失败: {e}")
-                # 可选：将错误显示在 m3u 中方便调试
-                # m3u_content.append(f"#EXTINF:-1 group-title=\"错误\", {name} 抓取失败")
-                # m3u_content.append("http://127.0.0.1/error")
+                logger.error(f"运行时错误 {name}: {e}")
+        else:
+            logger.error(f"跳过任务 {name}: 类加载失败")
 
     return Response('\n'.join(m3u_content), mimetype='text/plain; charset=utf-8')
 
-# 移除 app.run，由 Gunicorn 启动
+if __name__ == '__main__':
+    # 本地测试用的启动代码，Docker 中不会走到这里
+    app.run(host='0.0.0.0', port=5000)
